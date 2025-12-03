@@ -1,0 +1,173 @@
+---
+title: "EDA"
+author: "Eliza Baier"
+date: "`r Sys.Date()`"
+format: 
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    toc-float: true
+    toc-title: "Contents"
+    self-contained: true
+execute:
+  include: true
+  eval: true
+  warning: false
+  message: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(ggplot2)
+library(dplyr)
+library(tibble)
+```
+
+## Business Problem
+
+Swire Coca-Cola currently faces a problem with cart abandonment. Industry research from the Baymard Institute shows online retailers face average abandonment rates of 70%, causing the business to miss out on significant revenue.¹ Our purpose will be to understand what behaviors or external factors drive cart abandonment, measure it’s impact on Swire Coca-Cola, and identify what factors may influence customers to return and complete purchases.
+
+## EDA Questions
+
+- How do we merge the necessary datasets to extract the correct information?
+- How do we create a cutoff_timestamp from the information we have?
+- What are the limitations of the data?
+- What is the extent that missing data will impact our ability to analyze the dataset?
+- What is the extent of missing data in each table of interest?
+
+## Dataset Preparation
+
+The focus of my individual EDA was the google analytics data and the attached tables including operating_hours, cutoff_times, and visit_plan. To prepare the dataset for evaluation, there were several steps we took to create or adjust the columns on which to join the tables to achieved the desired outcome. We used databricks SQL notebooks to complete the feature engineering necessary for the joins as well as the joins themselves. We also ran several queries to check our work within the query editor function in databricks.  
+
+### Step 1: visit_plan cutoff_times merge
+
+Our first step was the merge the visit plan and cutoff_times tables to obtain a single table that contained the cutoff_times for all of the visit_plans. The cutoff_time table contained only the expectations to the 5:00pm cutoff rule and as such, we needed join the tables and populate all null columns with the 5:00pm cutoff. Additionally, there were some differences in how the information was presented in the tables. For example, the shipping condition description was in a different format across the two tables so we created new columns that matched across the two tables so that we could use the field as a join key. We completed a similar process for distribution mode and created a day of week for the anchor date so that in the future, we could compare cart abandonment by day of week if necessary.
+
+### Step 2: operating_hours table merge
+
+Our next step was to merge in the operating_hours table. We used a CTE to pull the frequency from the tables and used the visit_plan merged table as the overriding table when there were discrepancies between the information in the merged table and the operating_hours table. We also feature engineered the frequency field so that all of the different frequencies were formatted consistently. This was very helpful later when we had to convert the frequency to an integer. We then joined the two tables using a dual join key customer_id and anchor_day_of_week. 
+
+### Step 3: customer table merge
+
+Our next step was to join all of this information to the customer table so that we would end up with a table that contained all of the relevant information, including cutoff time for each customer. We used 5 join keys to create an accurate join and used a distinct statement to eliminate duplicate rows. I also concatenated distribution_mode and distribution_mode_desc for accuracy. After joining the customer table, we created an anchor_range which was used to determine when the policy changed. If the policy, and therefore the anchor_date, changed, then so did the cutoff_date. As such, this field was a very important one to create. 
+
+### Step 4: google_analytics merge
+
+Finally, after creating a merged table that had all of the relevant information by customer, we were able to start working on the join to the google_analytics table. The challenge was to create a cutoff_timestamp from the existing information and then join in such a way that the event_timestamp would be joined only to the corresponding cutoff_timestamp. To do this, we changed frequency to an integer so that it could be used in calculating the cutoff_date. We then created an exploded table with every possible cutoff_date for each customer given their anchor date and frequency. This was then filtered to include only the time range starting at the earliest timestamp in the google_analytics table data and continuing out 12 weeks from the end date to ensure that the cutoff dates that had been calculated for frequencies of 10 weeks would be included in the join (giving the correct end date, rather than a null value which preserved all of the necessary rows). We then combined the cutoff_date and cutoff_time provided by our previous code to create a cutoff_timestamp. After creating this cutoff_window table, we turned our attention to the google_analytics table. One issue we ran into was that the google_analytics timestamps were all in EST. To correct this, we used a CTE to parse out the state from the sales_office_desc and convert the event_timestamp to the local time. This created a new field event_timestamp_adj which we could then use to compare with the cutoff_timestamp. Finally, we joined the two tables using a window function partitioned by individual row to create a table with all of the relevant customer information attached to the google analytics data. This join worked by matching event_timestamp_adj with the closest upcoming cutoff_timestamp. Unfortunately, when we first ran the join, we did not partition by individual rows and ended up with about 500k rows of missing data, even after partitioning by all of the columns. As such, we went back and added a unique event_row_id to help preserve all of the data. We did end up losing about 75 rows to missing anchor dates and about 23k rows to missing sales_office_desc (which showed the location of the sales_office and was used to calculate the adjusted event timestamp) however in the face of the 3.6 million rows we had at the end, we decided to accept the loss - especially given the fact that without the information provided in those fields, we could not accurately determine cutoff_timestamp. 
+
+## Google Analytics Merged Data Analysis
+
+With the table joins complete, we then looked to the data to understand and analyze the extent of missing data and work to understand how it might impact our final analysis. 
+
+```{r}
+# Read in data
+ga <- read.csv("google_analytics_final.csv") |>
+  select(-EVENT_ROW_ID) # drop event_row_id as it is no longer necessary
+
+# Examine first 10 rows
+ga |>
+  head(10)
+```
+
+## Exploration of Missing Data
+
+In this dataset, null values are coded as the string value 'null' rather than NAs so to calculate the number of null values in each column, we used the following code.
+
+```{r}
+# print the number of null values in each column
+colSums(ga == "null")
+
+# print the number of empty strings in the items column
+sum(ga$ITEMS == "[]")
+```
+
+After this exploration, we found that the majority of our columns did not have any null values. However, there were a few columns that did have null values as summarized by the following table.
+
+```{r}
+# create a table that shows the fields and count of null values
+(null <- tibble(
+  field = c('DEVICE_MOBILE_BRAND_NAME', 'EVENT_PAGE_NAME', 'EVENT_PAGE_TITLE', 'ITEMS', 'COLD_DRINK_CHANNEL_DESCRIPTION', 'CUSTOMER_SUB_TRADE_CHANNEL_DESCRIPTION'),
+  null_count = c(39355, 997981, 317609, 2885208, 237886, 237886)
+))
+```
+
+```{r}
+# Plot histogram of DEVICE_MOBILE_BRAND_NAME
+ga |>
+  count(DEVICE_MOBILE_BRAND_NAME, sort = TRUE) |>
+  head(10) |>
+  ggplot(aes(x = fct_reorder(DEVICE_MOBILE_BRAND_NAME, n), y = n)) +
+  geom_bar(stat = "identity", fill = "#BB021E") +
+  labs(
+    title = "Top 10 Device Brand Names",
+    x = "Device Brand Name",
+    y = "Count"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r}
+# Create a histogram of the top 10 EVENT_PAGE_NAME values
+ga |>
+  count(EVENT_PAGE_NAME, sort = TRUE) |>
+  slice_head(n = 10) |>
+  ggplot(aes(x = fct_reorder(EVENT_PAGE_NAME, n), y = n)) +
+  geom_bar(stat = "identity", fill = "#BB021E") +
+  labs(
+    title = "Top 10 Event Page Names",
+    x = "Event Page Name",
+    y = "Count"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r}
+# Create a histogram of the top 10 EVENT_PAGE_TITLE values
+ga |>
+  count(EVENT_PAGE_TITLE, sort = TRUE) |>
+  slice_head(n = 10) |>
+  ggplot(aes(x = fct_reorder(EVENT_PAGE_TITLE, n), y = n)) +
+  geom_bar(stat = "identity", fill = "#BB021E") +
+  labs(
+    title = "Top 10 Event Page Titles",
+    x = "Event Page Title",
+    y = "Count"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
+```{r}
+# Plot histogram of COLD_DRINK_CHANNEL_DESCRIPTION
+ggplot(ga, aes(x = COLD_DRINK_CHANNEL_DESCRIPTION)) +
+  geom_bar(fill = "#BB021E") +
+  labs(
+    title = "Distribution of Cold Drink Channels",
+    x = "Cold Drink Channel Description",
+    y = "Count"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r}
+# Create a histogram of the top 10 CUSTOMER_SUB_TRADE_CHANNEL_DESCRIPTION values
+ga |>
+  count(CUSTOMER_SUB_TRADE_CHANNEL_DESCRIPTION, sort = TRUE) |>
+  slice_head(n = 10) |>
+  ggplot(aes(x = fct_reorder(CUSTOMER_SUB_TRADE_CHANNEL_DESCRIPTION, n), y = n)) +
+  geom_bar(stat = "identity", fill = "#BB021E") +
+  labs(
+    title = "Top 10 Customer Sub Trade Channels",
+    x = "Customer Sub Trade Channel Description",
+    y = "Count"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
