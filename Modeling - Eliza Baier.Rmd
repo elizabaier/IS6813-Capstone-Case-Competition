@@ -1,0 +1,712 @@
+---
+title: "Modeling"
+author: "Eliza Baier"
+date: "`r Sys.Date()`"
+format: 
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    toc-float: true
+    toc-title: "Contents"
+    self-contained: true
+execute:
+  include: true
+  eval: true
+  warning: false
+  message: false
+---
+
+## Introduction 
+
+The goal of this modeling notebook is to examine MyCoke360 digital ordering behavior and identify patterns that drive cart abandonment. The target outcome for this analysis is whether a cart is abandoned within an order window. During our exploratory data analysis, we created a target variable and calculated an abandonment rate that was focused at the customer level. After shifting to the purchase window as our unit of measure, which is represented by the `CART_ID` above, we decided we needed to recalculate our target variable. Using the `EVENT_NAME` column, we created a target variable by comparing it to the `EVENT_TIMESTAMP_ADJ` column from the orders table. This timestamp has been adjusted to the local time zone and indicates when an order was created. We compared it to the occurrence of any of the following events in the `EVENT_NAME` column: `add_to_cart`,`update_cart`, or `UpdateCart_Cart_Clicked`. Previously, we used just the `add_to_cart` event, but given that the `google_analytics` data is known to have missed some events, we broadened it to include these other events. If `EVENT_TIMESTAMP_ADJ` occurred between the last of these events and the `CUTOFF_TIMESTAMP`, the cart was classified as not abandoned. If these events never appeared within that time window, the cart was also considered not abandoned. However, if those events occurred but no `EVENT_TIMESTAMP_ADJ` fell within the purchase window before the cutoff, the cart was classified as abandoned. This translates to a supervised learning binary classification problem, where the negative class (0) represents carts that are completed within the order window, and the positive class (1) represents carts that are abandoned.
+
+This modeling report will cover:
+
+  -  Feature engineering including window id, cart id, our updated target variable, total items, and days since last purchased. 
+  -  Analysis of items in abandoned carts to answer the question - which items appear most often in abandoned carts?
+  -  Events and abandoned carts analysis that shows our understanding of the events that lead to cart abandonment.
+  -  Detailed information about our modeling efforts including an interrupted time series model, association rule mining, and two logistic regression models
+  -  Identification of limitations of our modeling efforts, future continuation ideas, and a summary of our findings and conclusions. 
+
+The insights gained from this analysis will helps us identify the behavioral patterns leading to cart abandonment. This will help us to develop interventions to prevent cart abandonment leading to increased customer engagement, increased revenue, and improved return on investment from Swire Coca-Cola's new MyCoke 360 interface. 
+
+By the end of this modeling notebook, we expect to:
+
+  -  Identify the most relevant features and event sequences that contribute to cart abandonment and recovery.
+  -  Generate descriptive statistics and visualizations to highlight abandonment patterns by cart, item, and event. 
+  -  Establish effective feature engineering and descriptive modeling that supports interventions to reduce abandonment.
+
+The findings from this analysis will serve as a foundational step in developing interventions that improve MyCoke360’s ability to optimize digital ordering behavior and minimize revenue loss.
+
+```{r message=FALSE, warning=FALSE}
+# Import libraries
+pacman::p_load(
+  tidyverse, skimr, dplyr, jsonlite, stringr, purrr, tidyr, ggplot2, tibble, 
+  caret, grf, fixest, lubridate, patchwork, data.table, randomForest, 
+  factoextra, mclust, arules, arulesViz, ranger, xgboost, tidytext, 
+  rsample, scales, rlang, speedglm, pROC, dbscan, plotly
+)
+
+# install.packages("dbscan") 
+
+# Import 
+gao <- fread("google_analytics_orders.csv") |>
+  dplyr::select(-EVENT_ROW_ID)
+materials <- fread("material.csv")
+orders <- fread("merged_orders_customer_material.csv")
+
+# Examine the data
+gao |>
+  head()
+```
+
+## Feature Engineering
+
+### Add Order Window ID 
+
+```{r}
+# Create function to assign windows
+assign_windows <- function(dt) {
+  # Ensure data.table
+  if (!data.table::is.data.table(dt)) data.table::setDT(dt)
+
+  # 1) Parse timestamps
+  dt[, `:=`(
+    CUTOFF_TIMESTAMP    = lubridate::ymd_hms(CUTOFF_TIMESTAMP, quiet = TRUE),
+    EVENT_TIMESTAMP_ADJ = lubridate::ymd_hms(EVENT_TIMESTAMP_ADJ, quiet = TRUE)
+  )]
+
+  # 2) Build windows from DISTINCT cutoffs (per customer)
+  ow <- unique(dt[, .(CUSTOMER_ID, CUTOFF_TIMESTAMP)])
+  data.table::setorder(ow, CUSTOMER_ID, CUTOFF_TIMESTAMP)
+  ow[, `:=`(
+    window_start = data.table::shift(CUTOFF_TIMESTAMP),
+    window_end   = CUTOFF_TIMESTAMP,
+    WINDOW_ID    = seq_len(.N)
+  ), by = CUSTOMER_ID]
+
+  # 3) Non-equi join — assign WINDOW_ID and window bounds
+  dt[
+    ow,
+    on = .(CUSTOMER_ID,
+           EVENT_TIMESTAMP_ADJ > window_start,
+           EVENT_TIMESTAMP_ADJ <= window_end),
+    `:=`(WINDOW_ID    = i.WINDOW_ID,
+         window_start = i.window_start,
+         window_end   = i.window_end)
+  ]
+
+  # 4) Reorder columns for clarity
+  if ("WINDOW_ID" %in% names(dt)) data.table::setcolorder(dt, c("CUSTOMER_ID", "WINDOW_ID"))
+
+  dt  # return modified table
+}
+
+# Run the function on the datset
+gao <- assign_windows(gao)
+
+
+# Create function to assign missing windows
+assign_missing_windows <- function(dt) {
+  stopifnot(is.data.table(dt))  # ensure it's a data.table
+  
+  # 1) Compute per-customer bounds from rows that already have a window
+  bounds <- dt[!is.na(WINDOW_ID),
+    .(
+      first_start = min(window_start, na.rm = TRUE),
+      last_end    = max(window_end,   na.rm = TRUE),
+      last_id     = max(WINDOW_ID,    na.rm = TRUE)
+    ),
+    by = CUSTOMER_ID
+  ]
+  
+  # 2) If NA and before earliest start -> set WINDOW_ID = 0
+  dt[bounds, on = .(CUSTOMER_ID),
+     WINDOW_ID := fifelse(is.na(WINDOW_ID) & EVENT_TIMESTAMP_ADJ <= i.first_start, 0L, WINDOW_ID)]
+  
+  # 3) If NA and after latest end -> set WINDOW_ID = (latest WINDOW_ID + 1)
+  dt[bounds, on = .(CUSTOMER_ID),
+     WINDOW_ID := fifelse(is.na(WINDOW_ID) & EVENT_TIMESTAMP_ADJ > i.last_end, i.last_id + 1L, WINDOW_ID)]
+  
+  # 4) Impute any remaining NAs with 0
+  dt[is.na(WINDOW_ID), WINDOW_ID := 0L]
+  
+  # 5) Remove columns
+  cols_to_remove <- c("window_start", "window_end")
+  dt[, (intersect(cols_to_remove, names(dt))) := NULL]
+  
+  invisible(dt)  # return silently but modifies in place
+}
+
+# Run the function on the datset
+gao <- assign_missing_windows(gao)
+```
+
+### `CART_ID`
+
+ To further understand cart abandonment, we decided to create a `cart_id` using the unique `customer_id` and `cutoff_timestamp`. This unique cart identifier allowed us to start develop an understanding of cart abandonment at the cart level, rather than just at the customer level. Thus, we were able to better understand the behaviors that led to cart abandonment by creating this analysis variable.
+ 
+```{r}
+# Create CART_ID variable
+create_cart_id <- function(gao) {
+  gao |>
+
+    # 2. Ensure proper timestamp formatting
+    mutate(
+      EVENT_TIMESTAMP_ADJ = ymd_hms(EVENT_TIMESTAMP_ADJ),
+      CUTOFF_TIMESTAMP = ymd_hms(CUTOFF_TIMESTAMP)
+    ) |>
+    
+    # 3. Create a unique cart identifier
+    mutate(CART_ID = paste(CUSTOMER_ID, CUTOFF_TIMESTAMP, sep = "_"))
+    
+}
+
+gao <- create_cart_id(gao)
+
+# Check new CART_ID variable
+gao |>
+  head()
+
+# Count the total number of CART_IDs
+gao |>
+  summarize(n_unique_carts = n_distinct(CART_ID)) # 50910
+
+# Sanity check for the number of unique CUSTOMER_ID and CUTOFF_TIMESTAMP combinations
+gao |>
+  group_by(CUSTOMER_ID, CUTOFF_TIMESTAMP) |>
+  summarize(.groups = "drop") |>
+  tally() |>
+  pull(n) # 50910  
+```
+
+### Create Target Variable
+
+During our exploratory data analysis, we created a target variable and calculated an abandonment rate that was focused at the customer level. After shifting to the purchase window as our unit of measure, which is represented by the `CART_ID` above, we decided we needed to recalculate our target variable.
+
+Using the `EVENT_NAME` column, we created a target variable by comparing it to the `EVENT_TIMESTAMP_ADJ` column from the orders table. This timestamp has been adjusted to the local time zone and indicates when an order was created. We compared it to the occurrence of any of the following events in the `EVENT_NAME` column: `add_to_cart`, `update_cart`, or `UpdateCart_Cart_Clicked`. Previously, we used just the `add_to_cart` event, but given that the `google_analytics` data is known to have missed some events, we broadened it to include these other events.
+
+If `EVENT_TIMESTAMP_ADJ` occurred between the last of these events and the `CUTOFF_TIMESTAMP`, the cart was classified as not abandoned. If these events never appeared within that time window, the cart was also considered not abandoned. However, if those events occurred but no `EVENT_TIMESTAMP_ADJ` fell within the purchase window before the cutoff, the cart was classified as abandoned.
+
+```{r}
+# define the cart abandonment function
+classify_cart_abandonment <- function(gao, orders) {
+  # parse order timestamps 
+  tz_events <- attr(gao$EVENT_TIMESTAMP_ADJ, "tzone")
+  if (is.null(tz_events) || identical(tz_events, "")) tz_events <- "UTC"
+
+  orders_parsed <- orders |>
+    mutate(
+      CREATED_POSIX = as.POSIXct(
+        CREATED_DATE_ADJUSTED,
+        format = "%Y-%m-%d %H:%M:%S%z",
+        tz = tz_events
+      )
+    ) |>
+    dplyr::select(CUSTOMER_ID, CREATED_POSIX)
+
+  # build one window per cart based on EVENT_NAME activity 
+  cart_windows <- gao |>
+    filter(EVENT_NAME %in% c("add_to_cart", "update_cart", "UpdateCart_Cart_Clicked")) |> # events that we consider creating a cart
+    group_by(CART_ID, CUSTOMER_ID) |>
+    summarise(
+      window_start = max(EVENT_TIMESTAMP_ADJ, na.rm = TRUE),  # last relevant event
+      window_end   = suppressWarnings(max(CUTOFF_TIMESTAMP, na.rm = TRUE)),
+      .groups = "drop"
+    ) |>
+    filter(!is.na(window_end), window_start <= window_end)
+
+  # match each cart window to orders by CUSTOMER_ID to classify abandonment 
+  cart_classified <- cart_windows |>
+    left_join(orders_parsed, by = "CUSTOMER_ID") |>
+    mutate(
+      in_window = !is.na(CREATED_POSIX) &
+                  CREATED_POSIX >= window_start &
+                  CREATED_POSIX <= window_end
+    ) |>
+    group_by(CART_ID) |>
+    summarise(ABANDONED = as.integer(!any(in_window, na.rm = TRUE)), .groups = "drop")
+
+  # add the ABANDONED target variable back to every event row 
+  gao_with_target <- gao |>
+    left_join(cart_classified, by = "CART_ID") |>
+    mutate(ABANDONED = ifelse(is.na(ABANDONED), 0L, ABANDONED))  # treat NAs as not abandoned
+
+  # print summary 
+  summary_counts <- gao_with_target |>
+    summarise(
+      total_carts = n_distinct(CART_ID),
+      abandoned_carts = n_distinct(CART_ID[ABANDONED == 1]),
+      not_abandoned_carts = n_distinct(CART_ID[ABANDONED == 0]),
+      pct_abandoned = round(100 * abandoned_carts / total_carts, 2),
+      pct_not_abandoned = round(100 * not_abandoned_carts / total_carts, 2)
+    )
+
+  cat("\n CART ABANDONMENT SUMMARY\n")
+  print(summary_counts)
+  cat("\n✅ The returned data frame contains", nrow(gao_with_target),
+      "rows — identical to the input gao.\n")
+
+  # return the full event-level dataset with target variable 
+  gao_with_target
+}
+
+
+# call function and create new data set
+gao <- classify_cart_abandonment(gao, orders)
+```
+
+Our number of carts stayed the same, as did our total number of observations. Of our 50,910 carts, a total of 7,539 were abandoned, giving us an abandonment rate of 14.81%.
+
+### Create TOTAL_ITEMS
+
+We wanted to evaluate how the number of items affected cart abandonment so we created a function to parse and calculate the number of items from the json string in the ITEMS column. This items column resulted in us being able to count the total number of items in a cart at any given time and was critical to our analysis. 
+
+```{r}
+sum_cart_quantities <- function(df, json_col, out_col = "TOTAL_ITEMS") {
+  
+  # Convert strings to symbols for tidy evaluation
+  json_col <- rlang::ensym(json_col)
+  out_col <- rlang::ensym(out_col)
+  
+  # Start timer
+  start_time <- Sys.time()
+  
+  message("⏳ Parsing JSON and summing quantities...")
+  
+  # Apply vectorized parsing logic
+  result <- df %>%
+    mutate(
+      !!out_col := sapply(!!json_col, function(x) {
+        # Handle empty / NA cases quickly
+        if (is.na(x) || x == "" || x == "[]") return(0)
+        
+        # Fix double-double quotes
+        x_clean <- gsub('""', '"', x, fixed = TRUE)
+        
+        # Safely parse JSON
+        items <- tryCatch(fromJSON(x_clean), error = function(e) NULL)
+        
+        # Return 0 if JSON invalid or doesn't have quantity
+        if (is.null(items) || !"quantity" %in% names(items)) return(0)
+        
+        # Sum quantities
+        sum(as.numeric(items$quantity), na.rm = TRUE)
+      })
+    )
+  
+  # End timer
+  end_time <- Sys.time()
+  message(sprintf("✅ Done in %.2f seconds", as.numeric(difftime(end_time, start_time, units = "secs"))))
+  
+  return(result)
+}
+
+# Apply to gao
+gao <- sum_cart_quantities(gao, ITEMS, TOTAL_ITEMS)
+
+# Show TOTAL_ITEMS distribution
+gao |>
+  ggplot(aes(x = TOTAL_ITEMS)) +
+  geom_histogram(bins = 100, fill = "#BB021E", color = "black", alpha = 0.8) +
+  labs(
+    title = "Distribution of Total Items per Cart",
+    x = "Total Items",
+    y = "Count"
+  ) +
+  coord_cartesian(xlim = c(0, 1000)) +
+  theme_minimal()
+
+# Bin total items properly into ITEM_BIN with fixed levels
+bin_levels <- c("1–9", "10–99", "100–999", "1K–9K", "10K–99K", "100K+")
+gao <- gao |>
+  mutate(
+    ITEM_BIN = cut(
+      TOTAL_ITEMS,
+      breaks = c(0, 10, 100, 1000, 10000, 100000, Inf),
+      labels = bin_levels,
+      include.lowest = TRUE,
+      right = FALSE
+    ),
+    ITEM_BIN = factor(ITEM_BIN, levels = bin_levels)  # <- this keeps *all* six bins
+  )
+
+# Plot ITEM_BIN variable
+gao |>
+  ggplot(aes(x = ITEM_BIN)) +
+  geom_bar(fill = "#BB021E", color = "black", alpha = 0.8) +
+  labs(
+    title = "Distribution of Total Items per Cart",
+    x = "Total Items",
+    y = "Count"
+  ) +
+  theme_minimal()
+```
+
+### Add Days Since Last Purchased Field
+
+To better understand if the recency of a purchase affects cart abandonment, we engineered a `days_since_last_purchase` variable. This feature measures the number of days between an event and the most recent purchase, providing a proxy variable for consumer engagement. Unfortunately, due to the short time window of this dataset, many customers do not have a prior recorded purchase. In this case, the variable is recorded as `NA` to signify the lack of history. This variable will help us distinguish between new and repeat customers without introducing data leakage via a binary feature.
+
+```{r}
+add_days_since_last_purchase <- function(df, customer_col = CUSTOMER_ID, 
+                                         event_col = EVENT_TIMESTAMP_ADJ, 
+                                         purchase_flag = PURCHASE_EVENT, 
+                                         out_col = DAYS_SINCE_LAST_PURCHASE) {
+  # Convert to quosures for tidy evaluation
+  customer_col <- enquo(customer_col)
+  event_col <- enquo(event_col)
+  purchase_flag <- enquo(purchase_flag)
+  out_col <- enquo(out_col)
+  
+  df |>
+    arrange(!!customer_col, !!event_col) |>
+    group_by(!!customer_col) |>
+    mutate(
+      # Capture last purchase date for each event
+      last_purchase_date = if_else(!!purchase_flag == 1, !!event_col, NA),
+      last_purchase_date = as_datetime(zoo::na.locf(last_purchase_date, na.rm = FALSE)),
+      # Compute days difference
+      !!out_col := floor(as.numeric(difftime(!!event_col, last_purchase_date, units = "days"))
+    )) |>
+    ungroup() |>
+    dplyr::select(-last_purchase_date)
+}
+
+gao <- gao |>
+  mutate(PURCHASE_EVENT = if_else(ABANDONED == 0, 1, 0)) |>
+  add_days_since_last_purchase()
+```
+
+```{r}
+# remove old target variable column from EDA to avoid confusion
+gao <- gao |>
+  dplyr::select(-ABANDONED_CART)
+
+# check to make sure removal worked.
+head(gao)
+```
+
+## Modeling
+
+### Attempted Modeling Efforts
+
+**Random Forest**
+
+Prior to our mentorship meetings with Professor Webb, we attempted a random forest model. However, as discussed in our **Summary of Findings** section, we experienced severe target variable leakage due to not removing the variables and rows that we used to create the original cart abandonment variable. Additionally, the random forest model was taking a very long time to run and after speaking with Professor Webb, we decided that such a complicated model was unnecessary due to our focus on behavioral descriptions over prediction.
+
+**Interrupted Time Series**
+
+We realized after doing some more investigation that this modeling approach wouldn't work because there is no way to find cart abandonment data before the treatment period because cart abandonment can only be calculated by google analytics data which is only available for the treatment period. We originally wanted to do causal modeling like 1WFE and time series but neither of these approaches worked because of the lack of cart abandonment data prior to the intervention.
+
+### Logistic Regression Model
+
+Originally, our baseline model achieved an AUC of approximately 0.85, meaning it correctly distinguished between abandoned and completed carts about 85% of the time. This seemed high for a basic model, since we have an 85/15 split on the majority/minority class, it was predicting the majority class the entire time.
+
+Moving forward, we pared down the analysis variables and fixed the data leakage that we saw in the first model. This approach allows us to move beyond simple one-to-one relationships and identify combinations of behaviors that meaningfully change the odds of abandonment.
+
+```{r}
+# Check for numeric variables in current dataset
+gao |>
+  glimpse()
+
+# New model dataframe
+lr <- gao |>
+  filter(!EVENT_NAME %in% c('add_to_cart', 'update_cart', 'UpdateCart_Cart_Clicked')) |>
+  dplyr::select(-c(WINDOW_ID, ITEMS, ANCHOR_DATE, SALES_OFFICE_DESC, DISTRIBUTION_MODE_DESC, CUTOFF_TIMESTAMP, CUSTOMER_ID, CART_ID, EVENT_PAGE_NAME, EVENT_PAGE_TITLE, CREATED_DATE_ADJUSTED_MATCH, EVENT_TIMESTAMP_ADJ, CUSTOMER_SUB_TRADE_CHANNEL_DESCRIPTION, TOTAL_ITEMS, PURCHASE_EVENT, DAYS_SINCE_LAST_PURCHASE, EVENT_NAME)) |>
+  mutate(
+    # convert all character columns to factors
+    across(where(is.character), as.factor)
+  )
+
+# Check that mutation and variable removal worked
+lr |>
+  glimpse()
+
+lr |>
+  str()
+```
+
+```{r}
+set.seed(673)
+idx <- createDataPartition(lr$ABANDONED, p = 0.7, list = FALSE)
+train <- lr[idx, ]
+test  <- lr[-idx, ]
+
+# Fit logistic regression
+lr_fit <- speedglm(ABANDONED ~ ., data = train, family = binomial())
+summary(lr_fit)
+
+# Evaluate on holdout
+test$pred_prob <- predict(lr_fit, newdata = test, type = "response")
+roc_obj <- roc(response = test$ABANDONED, predictor = test$pred_prob)
+auc_val <- auc(roc_obj)
+
+test$pred_class <- ifelse(test$pred_prob >= 0.5, 1, 0)
+
+cat("AUC:", round(auc_val, 3), "\n")
+caret::confusionMatrix(
+factor(test$pred_class, levels = c(0,1)),
+factor(test$ABANDONED, levels = c(0,1)),
+positive = "1"
+)
+```
+
+This logistic regression indicates that there is a statistically significant positive relationship between use of mobile device (as opposed to a tablet) and cart abandonment. Additionally, using a ChromeOS increases likelihood of abandonment while using an iOS or Linux OS decreases likelihood of abandonment. The frequency was also statistically significant. While a frequency of every 3 weeks had a positive relationship with abandonment, a frequency of every week or every 4 weeks was associated with lower abandonment. Certain anchor days of the week also had differing relationships with cart abandonment. Tuesday was most correlated with abandonment with Monday, Wednesday, and Thursday following behind. Interestingly, Sunday's correlation was negative and Saturday's was not statistically significant. Certain sales offices also had positive or negative correlations with cart abandonment. The highest correlations were with offices G151 and G152 located in Scottsbluff, NE and Cheyenne, WY respectively. Finally, the BK/OF/SL (bulk distribution, ofs, sideload) combination of distribution modes had the highest statistically significant positive correlation with cart abandonment. Most cutoff times had a negative correlation with cart abandonment. The cutoff times with the strongest negative correlation (>2) were 10am and 2:30pm. The type of customer (`COLD_DRINK_CHANNEL_DESCRIPTION`) of 'Hot Beverage' was highly negatively correlated with cart abandonment. Finally, the `ITEM_BIN` and `DEVICE_MOBILE_BRAND_NAME` variables had mixed results - mostly not statistically significant. These results provide valuable insights into cart abandonment that can be further explored.
+
+#### Device and OS
+
+```{r}
+# Plot abandonment rate by device
+lr1 <- gao |>
+  group_by(DEVICE_CATEGORY) |>
+  summarise(
+    abandonment_rate = mean(ABANDONED, na.rm = TRUE),
+    n = n()
+  ) |>
+  ggplot(aes(x = DEVICE_CATEGORY, y = abandonment_rate, fill = DEVICE_CATEGORY == 'mobile')) +
+  geom_col(alpha = 0.8) +  # Swire Coca-Cola red
+  scale_fill_manual(values = c("TRUE" = "#BB021E", "FALSE" = "gray70")) +
+  labs(
+    title = "Abandonment Rate by Device",
+    x = "Device Type",
+    y = "Abandonment Rate"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(hjust = 0.5),
+    plot.title = element_text(color = "black"),
+    axis.title = element_text(color = "black"),
+    axis.text = element_text(color = "black"),
+    legend.position = "none"
+  )
+
+# Extract logistic regression coefficients
+coef_df <- data.frame(
+  term = names(coef(lr_fit)),
+  estimate = coef(lr_fit)
+) |>
+  filter(grepl("DEVICE_OPERATING_SYSTEM", term)) |>
+  mutate(
+    OS = gsub("DEVICE_OPERATING_SYSTEM", "", term)   # clean term name
+  ) |>
+  filter(!OS %in% c("Macintosh", "Windows")) |>      # remove unwanted OS
+  mutate(
+    color = case_when(
+      OS == "Chrome OS" ~ "#BB021E",                 # red
+      OS %in% c("iOS", "Linux") ~ "black",
+      TRUE ~ "gray70"
+    )
+  )
+
+# Plot
+lr2 <- ggplot(coef_df, aes(x = reorder(OS, estimate), y = estimate, fill = color)) +
+  geom_col() +
+  scale_fill_identity() +
+  labs(
+    title = "Effect of OS on Abandonment",
+    x = "Operating System",
+    y = "Logistic Regression Coefficient"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(hjust = 0.5),
+    plot.title = element_text(color = "black"),
+    axis.title = element_text(color = "black"),
+    axis.text = element_text(color = "black"),
+    legend.position = "none"
+  )
+
+lr1 | lr2
+```
+
+The plot on the left combined with the logistic regression clearly shows that mobile devices have a statistically significant higher level of cart abandonment. This may be because of difficulty placing orders on a smaller mobile screen or may be due to issues with the mobile application. It may be possible to decrease cart abandonment by encouraging or incentivising customers to use tablets or desktop application.
+
+The plot on the right shows the statistically significant OS effects from the logistic regression. It is clear that Linux and iOS have a negative correlation with cart abandonment while Chrome OS has a positive correlation. It would be difficult to control customer OS but this gives us valuable information that could be used to target customers using a Chrome OS to help decrease their abandonment rates. 
+
+#### Order Frequency and Anchor Day of Week
+
+```{r}
+# Extract coefficients from your logistic regression model
+freq_coef_df <- data.frame(
+  term = names(coef(lr_fit)),
+  estimate = coef(lr_fit)
+) |>
+  # Keep only frequency terms
+  filter(grepl("FREQUENCY_FINAL", term)) |>
+  mutate(
+    # Clean term names
+    frequency = gsub("FREQUENCY_FINAL", "", term),
+    # Assign colors
+    fill_color = case_when(
+      frequency == "Every 3 Weeks" ~ "#BB021E",          # red
+      frequency %in% c("Every Week", "Every 4 Weeks") ~ "black",
+      TRUE ~ "gray70"
+    )
+  )
+
+# Plot coefficients
+lr3 <- ggplot(freq_coef_df, aes(x = reorder(frequency, estimate), y = estimate, fill = fill_color)) +
+  geom_col() +
+  scale_fill_identity() +
+  labs(
+    title = "Effect of Frequency on Cart Abandonment",
+    x = "Frequency",
+    y = "Logistic Regression Coefficient"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(hjust = 0.5, color = "black"),
+    axis.text.y = element_text(color = "black"),
+    axis.title = element_text(color = "black"),
+    plot.title = element_text(color = "#BB021E", hjust = 0),
+    legend.position = "none"
+  )
+
+# Plot ANCHOR_DAY_OF_WEEK
+important_days <- c("Tuesday", "Monday", "Wednesday", "Thursday")
+
+day_levels <- c("Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday")
+
+lr4 <- gao |>
+  group_by(ANCHOR_DAY_OF_WEEK) |>
+  summarise(abandonment_rate = mean(ABANDONED, na.rm = TRUE)) |>
+  mutate(
+    # Order days correctly
+    ANCHOR_DAY_OF_WEEK = factor(ANCHOR_DAY_OF_WEEK, levels = day_levels),
+    # Highlight important days
+    fill_color = ifelse(ANCHOR_DAY_OF_WEEK %in% important_days, "#BB021E", "gray70")
+  ) |>
+  ggplot(aes(x = ANCHOR_DAY_OF_WEEK, y = abandonment_rate, fill = fill_color)) +
+  geom_col() +
+  scale_fill_identity() +
+  labs(
+    title = "Abandonment by Anchor Day",
+    x = "Day of Week",
+    y = "Abandonment Rate"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 0.5, color = "black"),
+    axis.text.y = element_text(color = "black"),
+    axis.title = element_text(color = "black"),
+    plot.title = element_text(color = "#BB021E", hjust = 0),
+    legend.position = "none"
+  )
+
+lr3 | lr4
+```
+
+These plots clearly show that ordering every week or every 4 weeks is associated with less cart abandonment while ordering every 3 weeks is correlated with more cart abandonment. Additionally, the anchor weekdays Monday - Thursday have the highest abandonment rates. This helps use understand who Swire should target with their interventions to reduce cart abandonment. 
+
+#### Sales Office and Distribution Mode
+
+```{r}
+# Sales office plot
+important_offices <- c("G151", "G152")
+
+sales_office_plot <- gao |>
+  group_by(SALES_OFFICE) |>
+  summarise(abandonment_rate = mean(ABANDONED, na.rm = TRUE)) |>
+  ungroup() |>
+  slice_max(abandonment_rate, n = 10) |>   # keep top 10
+  mutate(
+    fill_color = ifelse(SALES_OFFICE %in% important_offices, "#BB021E", "gray70")
+  ) |>
+  ggplot(aes(x = reorder(SALES_OFFICE, abandonment_rate), y = abandonment_rate, fill = fill_color)) +
+  geom_col() +
+  scale_fill_identity() +
+  labs(
+    title = "Abandonment by Sales Office",
+    subtitle = "Top 10",
+    x = "Sales Office",
+    y = "Abandonment Rate"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 0.5, color = "black"),
+    axis.text.y = element_text(color = "black"),
+    axis.title = element_text(color = "black"),
+    plot.title = element_text(color = "#BB021E", hjust = 0),
+    legend.position = "none"
+  )
+
+# Distribution mode plot
+important_distribution <- "BK; OF; SL"
+
+distribution_plot <- gao |>
+  group_by(DISTRIBUTION_MODE) |>
+  summarise(abandonment_rate = mean(ABANDONED, na.rm = TRUE)) |>
+  ungroup() |>
+  slice_max(abandonment_rate, n = 10) |>   # keep top 10
+  mutate(
+    fill_color = ifelse(DISTRIBUTION_MODE == important_distribution, "#BB021E", "gray70")
+  ) |>
+  ggplot(aes(x = reorder(DISTRIBUTION_MODE, abandonment_rate), y = abandonment_rate, fill = fill_color)) +
+  geom_col() +
+  scale_fill_identity() +
+  labs(
+    title = "Abandonment by Distribution Mode",
+    subtitle = "Top 10",
+    x = "Distribution Mode",
+    y = "Abandonment Rate"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 0.5, color = "black"),
+    axis.text.y = element_text(color = "black"),
+    axis.title = element_text(color = "black"),
+    plot.title = element_text(color = "#BB021E", hjust = 0),
+    legend.position = "none"
+  )
+
+# Facet wrap plots
+sales_office_plot | distribution_plot
+```
+
+These two plots show the top 10 sales offices and distribution modes by abandonment rate with high statistically significant correlation with abandonment highlighted in red. Offices G151 and G152 located in Scottsbluff, NE and Cheyenne, WY respectively had a high correlation with cart abandonment when running the logistic model. As such, it may be that businesses ordering from Cheyenne and Scottsbluff are more likely to abandon their carts because of the rural nature of the distributor offices. There may be issues especially with the Cheyenne location that cause customers to abandon their carts. This should be further studied to understand what the issue could be. Also, it seems that the combination of bulk distribution, ofs, and sideload lead to increased abandonment. This could be because of the variety of ways in which the goods are delivered. This might complicate the ordering process which leads to increased cart abandonment. Further industry knowledge is necessary to definitively understand the significance of these factors in cart abandonment. 
+
+## Summary of Findings
+
+### Prevention of Target Variable Leakage
+
+In our original modeling efforts, we realized that the `EVENT_NAME` variable we used to create the target variable was resulting in target leakage into our models. This was evident because the `EVENT_NAME` variable was by far the highest feature importance in our Random Forest model. Additionally, when analyzing cart abandonment rates by `EVENT_NAME`, we found that the `EVENT_NAME` values that were used to create the target abandonment variable were the only ones with an abandonment rate > 1. As a result, in our final models, we not only removed the target but also filtered to exclude the event names that we used to build our cart abandonment variable. This ensured that there was no target variable leakage. One limitation of our efforts is that because we removed rows from our data to prevent target variable leakage, we may not be capturing the full behavioral panel that leads to cart abandonment. However, we are confident that our analysis captures the most significant behaviors leading to cart abandonment.
+
+### Acknowledgement of Limitations
+
+During our analysis, we encountered several limitations that constrained our modeling and interpretability:
+
+ - **Lack of control data:** No pre-treatment window to analyze whether the platform changes caused an effect in cart abandonment.
+ - **Missing data:** `google_analytics` doesn't capture all events - it appears that some were deleted or not logged properly.
+ - **Outliers:** Known outliers in the data that skewed results.
+ - **Highly correlated features:** Many features exhibited multicollinearity, complicating coefficient interpretation in regression models. It also caused increased difficulty in separating observations for clustering.
+
+### Conclusion of Findings
+
+Our final modeling efforts identified clear behavioral and contextual patterns influencing digital cart abandonment on the MyCoke360 platform. Unfortunately, during compilation we suffered some data leaking in our logistic regression models that we haven't quite rooted out yet. However, after addressing early leakage issues, our logistic regression models could be capable of providing interpretable, credible insights into how user interactions relate to purchase completion. We will continue to address leakage issues this week.
+
+Key findings include:
+
+ - **Device category played a significant role:** mobile users showed a higher probability of abandonment compared to desktop users, consistent with potential usability friction on smaller screens.
+
+ - **Cart size and item volume were strong predictors:** very small and very large carts were more likely to be abandoned, suggesting both low-intent “browsers” and overwhelmed bulk purchasers may disengage before checkout.
+
+ - **Days since last purchase negatively correlated with abandonment:** customers who purchased more recently were less likely to abandon their carts, indicating that engagement and familiarity reduce drop-off risk.
+
+ - **Event-level analysis:** revealed that repetitive behaviors such as `UpdateCart_Cart_Clicked` and frequent page revisits are associated with hesitation and increased abandonment odds.
+
+After preventing target leakage and ensuring cart-level independence between training and testing data, the final logistic regression achieved a realistic AUC between 0.70–0.75, indicating moderate predictive ability while maintaining interpretability.
+
+These results reinforce the importance of interface simplification, proactive cart reminders, and behavioral segmentation as potential interventions. While the limited time window of available data constrained causal inference and time-series modeling, this framework provides a validated foundation for expanding predictive monitoring and designing future experiments that can directly quantify improvements in conversion and digital engagement.
+
+### Future Continuation 
+
+While our models successfully described behaviors associated with cart abandonment, there are several opportunities available for further examination and refinement. 
+
+Future  continuation upon this modeling could include:
+
+ - Causal Inference: Expanding dataset to include pre-treatment data. Introduce experimental designs to estimate possible causal impact of the new platform. 
+ 
+ - Deployment and monitoring: Package the final model into a production-ready dashboard or API, enabling continuous monitoring of predicted abandonment risk and real-time alerts for high-risk carts.
+ 
+ - Temporal and sequence modeling: Also requiring an expanded dataset that includes pre-treatment data, we could implement time-aware models to capture event-level sequences and transitions that precede abandonment, allowing us to better understand behavioral activity through the ordering funnel.
